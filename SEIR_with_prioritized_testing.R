@@ -20,18 +20,22 @@ filename = "SEIR_model.pdf"
 ##### specify parameters #####
 {
 # simulation parameters
-Tmax <- 2*365 # time limit of simulations
+Tmax <- 2*365 # time limit of simulations 
 step.size <- 1 # time steps (days)
 rep <- 1000 # number of stochastic simulations to run for prioritized/random testing 
 n.seed.events <- 15 # number of infected people at start of simulation
-initial.state <- c(S=3200000-n.seed.events, E=0, I=n.seed.events, R=0)
+initial.state <- c(S=3200000-n.seed.events, E=0, I=n.seed.events, R=0, Ts=0, Te=0, Ti=0, Tr=0) 
+# NOTE: cannot start off with any nonzero Ts, Te, Ti, or Tr, because they won't be in the "waiting.people" list
+
 # model is frequency dependent, so we modify beta based on the total population size
 beta.divisor <- as.numeric(initial.state["S"]+initial.state["E"]+initial.state["I"]+initial.state["R"])
 
 ##### testing parameters #####
 w <- c(0.0013, 0.0013, 0.072, 0.00084) # proportion of S, E, I, R that want testing
-p1 <- 0.7 # proportion of E that test positive
 Ntests <- 1000 # number of tests available
+theta <- 2 # test turnaround time (days)
+eta <- 0.2 # reduction in transmissibility for infected awaiting test results
+
 
 # define colors
 {
@@ -55,7 +59,8 @@ Ntests <- 1000 # number of tests available
 runSEIR <- function( prior.test=TRUE, final.only=FALSE) {
   
   # SEIR parameters
-  sigma <- 1/5.2      ## sigma = 1/5.2 per day E -> I
+  {
+  sigma <- 1/5.2      # sigma = 1/5.2 per day E -> I
   gamma.days <- runif(1, min=4, max=7)
   gamma <- 1/gamma.days        ## gamma = 1/6 per day I -> R
   beta <- gamma*R0
@@ -65,27 +70,34 @@ runSEIR <- function( prior.test=TRUE, final.only=FALSE) {
   
   t <- 0
   y <- c(initial.state)
-  seir.output <- matrix(ncol=9, nrow=1)
-  colnames(seir.output) <- c("time", "S", "E", "I","R","n0","n1","AUC","R0")
+  seir.output <- matrix(ncol=13, nrow=1)
+  colnames(seir.output) <- c("time", "S", "E", "I","R","Ts", "Te", "Ti", "Tr","n0","n1","AUC","R0")
   seir.output[1,] <- c(t,y,NA,NA,NA,NA)
+  
+  waiting.people <- matrix(ncol=7,nrow=0)
+  colnames(waiting.people) <- c(colnames(data0),"states")
+  waiting.people[,"states"] <- factor(c("S","E","I","R"))
+  }
   
   while (t < Tmax){
     t <- t+step.size 
-
+    #print(t)
+    
+    ### STEP 1 - NEW PEOPLE GET TESTED #####################################################
     ##### COVID TESTING SIMULATION #####
-    n0 <- round(w[1]*y["S"]) + round(w[2]*(1-p1)*y["E"]) + round(w[4]*y["R"]) # nubmer of '0's wanting testing
-    n1 <- round(w[2]*p1*y["E"]) + round(w[3]*y["I"]) # number of '1's wanting testing
+    Test.eligible.S <- rbinom(1,y["S"],w[1])
+    Test.eligible.E <- rbinom(1,y["E"],w[2])
+    Test.eligible.I <- rbinom(1,y["I"],w[3])
+    Test.eligible.R <- rbinom(1,y["R"],w[4])
+    n0 <- Test.eligible.S + Test.eligible.E + Test.eligible.R # nubmer of '0's wanting testing
+    n1 <- Test.eligible.I # number of '1's wanting testing
     
     # set up patient "pool" of people who all want testing
     patients0 <- data0[sample(nrow(data0),n0,replace=TRUE),]
     patients1 <- data1[sample(nrow(data1),n1,replace=TRUE),]
-    nS <- round(w[1]*y["S"])
-    nE0 <- round(w[2]*(1-p1)*y["E"])
-    nR <- round(w[4]*y["R"])
-    nE1 <- round(w[2]*p1*y["E"])
-    nI <- round(w[3]*y["I"])
     
-    states <- rep(c("S","E","R","E","I"), c(nS,nE0,nR,nE1,nI)) # vector of associated states
+    states <- as.factor(rep(c("S","E","R","I"), c(Test.eligible.S,Test.eligible.E,Test.eligible.R,Test.eligible.I))) # vector of associated states
+    levels(states)[c("S","E","I","R")] <- c("S","E","I","R")
     # need "0 states" listed first, followed by "1 states", since that's how they are combined below
     
     samp <- rbind(patients0, patients1)
@@ -96,37 +108,151 @@ runSEIR <- function( prior.test=TRUE, final.only=FALSE) {
       AUC <- NA
     }
 
-    if (prior.test){
+    if (prior.test){ # if doing prioritized testing
       samp <- samp[order(-samp$pred_RF),]
       tested <- samp[1:min(nrow(samp),Ntests),]
-      dE.test <- sum(tested$states == "E" & tested$true == 1)
-      dI.test <- sum(tested$states == "I")
-    }else{
+    }else{ # if testing randomly
       tested <- sample_n(samp, min(nrow(samp),Ntests),replace=FALSE)
-      dE.test <- sum(tested$states == "E" & tested$true == 1)
-      dI.test <- sum(tested$states == "I")
     }
+    
+    # number of people in each state that get tested:
+    dS.test <- sum(tested$states == "S")
+    dE.test <- sum(tested$states == "E")
+    dI.test <- sum(tested$states == "I")
+    dR.test <- sum(tested$states == "R")
+    
+    # move people into the "waiting for test results" bins
+    {
+    y["S"] <- y["S"]-dS.test
     y["E"] <- y["E"]-dE.test
     y["I"] <- y["I"]-dI.test
-    y["R"] <- y["R"]+dE.test+dI.test
+    y["R"] <- y["R"]-dR.test
+    y["Ts"] <- y["Ts"]+dS.test
+    y["Te"] <- y["Te"]+dE.test
+    y["Ti"] <- y["Ti"]+dI.test
+    y["Tr"] <- y["Tr"]+dR.test
+    }
     
-    # SEIR dynamics 
-    p.expose <- 1-exp(-step.size*param["beta"]*y["I"])
+    # add record of tested people to list of people awaiting test results (need to track their states explicitly)
+    waiting.people <- rbind(waiting.people,tested)
+    
+    ### STEP 2 - DISEASE DYNAMICS ##################################################33
+    
+    # dynamics for SEIR states
+    p.expose <- 1-exp(-step.size*(param["beta"]*y["I"] + param["beta"]*eta*y["Ti"]))
     p.infect <- 1-exp(-step.size*param["sigma"])
     p.recover <- 1-exp(-step.size*param["gamma"])
     
-    exposed.cases <- rbinom(1, y["S"],p.expose)
-    incident.cases <- rbinom(1, y["E"],p.infect)
-    recovered.cases <- rbinom(1, y["I"], p.recover)
+    exposed.cases <- rbinom(1, y["S"],p.expose) # S->E
+    incident.cases <- rbinom(1, y["E"],p.infect) # E->I
+    recovered.cases <- rbinom(1, y["I"], p.recover) # I->R
     
-    #Find the deltas for the compartments
-    dS <- -exposed.cases 
-    dE <- exposed.cases - incident.cases
-    dI <- incident.cases - recovered.cases
-    dR <- recovered.cases
+    # dynamics for Ts,Te,Ti,Tr states (same as p.expose above, except with the additional eta)
+    p.test.expose <- 1-exp(-step.size*(eta*param["beta"]*y["I"] + eta*param["beta"]*eta*y["Ti"])) 
+    p.test.infect <- 1-exp(-step.size*param["sigma"]) 
+    p.test.recover <- 1-exp(-step.size*param["gamma"]) 
+
+    exposed.tested.cases <- rbinom(1, y["Ts"],p.test.expose) # Ts->Te
+    incident.tested.cases <- rbinom(1, y["Te"],p.test.infect) # Te->Ti
+    recovered.tested.cases <- rbinom(1, y["Ti"],p.test.recover) # Ti->Tr
     
-    delta <- c(dS,dE,dI,dR) # calculate step sizes
-    y <- y+delta
+    # disease dynamics move people between bins
+    {
+    y["S"] <- y["S"]-exposed.cases
+    y["E"] <- y["E"]+exposed.cases-incident.cases
+    y["I"] <- y["I"]+incident.cases-recovered.cases
+    y["R"] <- y["R"]+recovered.cases
+    y["Ts"] <- y["Ts"]-exposed.tested.cases
+    y["Te"] <- y["Te"]+exposed.tested.cases-incident.tested.cases
+    y["Ti"] <- y["Ti"]+incident.tested.cases-recovered.tested.cases
+    y["Tr"] <- y["Tr"]+recovered.tested.cases
+    }
+    # change state labels on people in waiting.people list (important for when they get test results back)
+    
+    if(exposed.tested.cases > 0){
+      if(length(which(waiting.people$states == "S"))==1 & exposed.tested.cases==1){
+        waiting.people[which(waiting.people$states=="S"),]$states="E"}
+      if(length(which(waiting.people$states == "S"))>1){
+        waiting.people[sample(which(waiting.people$states == "S"),exposed.tested.cases), ]$states="E"}
+    }
+    
+    if(incident.tested.cases > 0){
+      if(length(which(waiting.people$states == "E"))==1 & incident.tested.cases==1){
+        waiting.people[which(waiting.people$states=="E"),]$states="I"}
+      if(length(which(waiting.people$states == "E"))>1){
+        waiting.people[sample(which(waiting.people$states == "E"),incident.tested.cases), ]$states="I"}
+    }
+    
+    if(recovered.tested.cases > 0){
+      if(length(which(waiting.people$states == "I"))==1 & recovered.tested.cases==1){
+        waiting.people[which(waiting.people$states=="I"),]$states="R"}
+      if(length(which(waiting.people$states == "I"))>1){
+        waiting.people[sample(which(waiting.people$states == "I"),recovered.tested.cases), ]$states="R"}
+    }
+      
+
+    ### STEP 3 - PEOPLE GET TEST RESULTS BACK AND RETURN TO SEIR BINS ##################################################
+    p.testresults <- 1-exp(-step.size*(1/theta)) # probability of getting test results back on a given day
+    
+    # number of people in each state Ts,Te,Ti,Tr getting results back
+    testresults.S <- rbinom(1, y["Ts"],p.testresults) 
+    testresults.E <- rbinom(1, y["Te"],p.testresults) 
+    testresults.I <- rbinom(1, y["Ti"],p.testresults) 
+    testresults.R <- rbinom(1, y["Tr"],p.testresults) 
+    
+    if(testresults.S > 0){
+      if(length(which(waiting.people$states == "S"))==1 & testresults.S==1){
+        waiting.people <- waiting.people[-which(waiting.people$states=="S"),]}
+      if(length(which(waiting.people$states == "S"))>1){
+        waiting.people <- waiting.people[-sample(which(waiting.people$states == "S"),testresults.S), ]}
+    }
+    TestS2S <- testresults.S
+    
+    if(testresults.E > 0){
+      if(length(which(waiting.people$states == "E"))==1 & testresults.E==1){
+        waiting.people <- waiting.people[-which(waiting.people$states=="E"),]}
+      if(length(which(waiting.people$states == "E"))>1){
+        waiting.people <- waiting.people[-sample(which(waiting.people$states == "E"),testresults.E), ]}
+    }
+    TestE2E <- testresults.E
+    
+    if(testresults.I > 0){
+      if(length(which(waiting.people$states == "I"))==1 & testresults.I==1){
+        I.results <- waiting.people[which(waiting.people$states=="I"),]
+        waiting.people <- waiting.people[-which(waiting.people$states=="I"),]}
+      if(length(which(waiting.people$states == "I"))>1){
+        I.ind <- sample(which(waiting.people$states == "I"),testresults.I)
+        I.results <- waiting.people[I.ind,]
+        waiting.people <- waiting.people[-I.ind, ]}
+      TestI2I <- nrow(I.results[I.results$true == 0,]) # people now in I who got tested when they weren't in I
+      TestI2R <- nrow(I.results[I.results$true == 1,]) # people now in I who got tested when they were in I
+    } else {
+      TestI2I<-0
+      TestI2R<-0
+      }
+    
+    if(testresults.R > 0){
+      if(length(which(waiting.people$states == "R"))==1 & testresults.R==1){
+        R.results <- waiting.people[which(waiting.people$states=="R"),]
+        waiting.people <- waiting.people[-which(waiting.people$states=="R"),]}
+      if(length(which(waiting.people$states == "R"))>1){
+        R.ind <- sample(which(waiting.people$states == "R"),testresults.R)
+        R.results <- waiting.people[R.ind,]
+        waiting.people <- waiting.people[-R.ind, ]}
+    }
+    TestR2R <- testresults.R
+    
+    # test results move people between bins
+    {
+    y["S"] <- y["S"]+TestS2S
+    y["E"] <- y["E"]+TestE2E
+    y["I"] <- y["I"]+TestI2I
+    y["R"] <- y["R"]+TestI2R+TestR2R
+    y["Ts"] <- y["Ts"]-TestS2S
+    y["Te"] <- y["Te"]-TestE2E
+    y["Ti"] <- y["Ti"]-TestI2I-TestI2R
+    y["Tr"] <- y["Tr"]-TestR2R
+    }
     
     #trick to speed up the code
     if (!final.only) {
@@ -134,7 +260,7 @@ runSEIR <- function( prior.test=TRUE, final.only=FALSE) {
     }
   }
   
- if(final.only) {
+  if(final.only) {
     seir.output[1,]<-c(t,y,n0,n1,auc,R0)
   }
   return(seir.output)
@@ -205,14 +331,14 @@ R0.vals.p.t <- numeric()
 for(i in 1:rep){
   #print(i)
   output.table.p.t[[i]] <- as.data.frame(runSEIR(prior.test=TRUE, final.only=FALSE))
-  S.vals.p.t <- cbind(S.vals.p.t,output.table.p.t[[i]][,2])
-  E.vals.p.t <- cbind(E.vals.p.t,output.table.p.t[[i]][,3])
-  I.vals.p.t <- cbind(I.vals.p.t,output.table.p.t[[i]][,4])
-  R.vals.p.t <- cbind(R.vals.p.t,output.table.p.t[[i]][,5])
-  n0.vals.p.t <- cbind(n0.vals.p.t,output.table.p.t[[i]][,6])
-  n1.vals.p.t <- cbind(n1.vals.p.t,output.table.p.t[[i]][,7])
-  AUC.mean.p.t <- cbind(AUC.mean.p.t,mean(na.omit(output.table.p.t[[i]][,8])))
-  R0.vals.p.t <- cbind(R0.vals.p.t,output.table.p.t[[i]][,9])
+  S.vals.p.t <- cbind(S.vals.p.t,output.table.p.t[[i]][,2]+output.table.p.t[[i]][,6])
+  E.vals.p.t <- cbind(E.vals.p.t,output.table.p.t[[i]][,3]+output.table.p.t[[i]][,7])
+  I.vals.p.t <- cbind(I.vals.p.t,output.table.p.t[[i]][,4]+output.table.p.t[[i]][,8])
+  R.vals.p.t <- cbind(R.vals.p.t,output.table.p.t[[i]][,5]+output.table.p.t[[i]][,9])
+  n0.vals.p.t <- cbind(n0.vals.p.t,output.table.p.t[[i]][,10])
+  n1.vals.p.t <- cbind(n1.vals.p.t,output.table.p.t[[i]][,11])
+  AUC.mean.p.t <- cbind(AUC.mean.p.t,mean(na.omit(output.table.p.t[[i]][,12])))
+  R0.vals.p.t <- cbind(R0.vals.p.t,output.table.p.t[[i]][,13])
 }
 
 # save mean values
@@ -238,10 +364,10 @@ results<-output.table.p.t
   Rvals = NULL
   
   for (i in 1:rep) {
-    Svals = rbind(results[[i]][, 2], Svals)
-    Evals = rbind(results[[i]][, 3], Evals)
-    Ivals = rbind(results[[i]][, 4], Ivals)
-    Rvals = rbind(results[[i]][, 5], Rvals)
+    Svals = rbind(results[[i]][, 2]+results[[i]][, 6], Svals)
+    Evals = rbind(results[[i]][, 3]+results[[i]][, 7], Evals)
+    Ivals = rbind(results[[i]][, 4]+results[[i]][, 8], Ivals)
+    Rvals = rbind(results[[i]][, 5]+results[[i]][, 9], Rvals)
   }
   
   Svals <- apply(Svals, 2, sort)
@@ -310,14 +436,14 @@ lines(R.mean.p.t/1000000, col=GreyCustom, lwd=2)
 
 for(i in 1:rep){
   output.table.r.t[[i]] <- as.data.frame(runSEIR(prior.test=FALSE, final.only=FALSE))
-  S.vals <- cbind(S.vals,output.table.r.t[[i]][,2])
-  E.vals <- cbind(E.vals,output.table.r.t[[i]][,3])
-  I.vals <- cbind(I.vals,output.table.r.t[[i]][,4])
-  R.vals <- cbind(R.vals,output.table.r.t[[i]][,5])
-  n0.vals <- cbind(n0.vals,output.table.r.t[[i]][,6])
-  n1.vals <- cbind(n1.vals,output.table.r.t[[i]][,7])
-  AUC.means.r.t <- cbind(AUC.means.r.t,mean(na.omit(output.table.r.t[[i]][,8])))
-  R0.vals <- cbind(R0.vals,output.table.r.t[[i]][,9])
+  S.vals <- cbind(S.vals,output.table.r.t[[i]][,2]+output.table.r.t[[i]][,6])
+  E.vals <- cbind(E.vals,output.table.r.t[[i]][,3]+output.table.r.t[[i]][,7])
+  I.vals <- cbind(I.vals,output.table.r.t[[i]][,4]+output.table.r.t[[i]][,8])
+  R.vals <- cbind(R.vals,output.table.r.t[[i]][,5]+output.table.r.t[[i]][,9])
+  n0.vals <- cbind(n0.vals,output.table.r.t[[i]][,10])
+  n1.vals <- cbind(n1.vals,output.table.r.t[[i]][,11])
+  AUC.means.r.t <- cbind(AUC.means.r.t,mean(na.omit(output.table.r.t[[i]][,12])))
+  R0.vals <- cbind(R0.vals,output.table.r.t[[i]][,13])
 }
 
 {
@@ -344,10 +470,10 @@ results<-output.table.r.t #SMA
 }
 
 for(i in 1:rep){
-  Svals = rbind(results[[i]][,2], Svals)
-  Evals = rbind(results[[i]][,3], Evals)
-  Ivals = rbind(results[[i]][,4], Ivals)
-  Rvals = rbind(results[[i]][,5], Rvals)
+  Svals = rbind(results[[i]][,2]+results[[i]][,6], Svals)
+  Evals = rbind(results[[i]][,3]+results[[i]][,7], Evals)
+  Ivals = rbind(results[[i]][,4]+results[[i]][,8], Ivals)
+  Rvals = rbind(results[[i]][,5]+results[[i]][,9], Rvals)
 }
 
 #### calculate confidence bounds ####
@@ -469,7 +595,7 @@ dev.off()
 
 ###########################################################3
 #### plot hospital/ICU capacity ####
-pdf(file="hospital_ICU_demand.pdf",width=7.5, height=11*.8)
+pdf(file="hospital_ICU_demand_with_delayed_results.pdf",width=7.5, height=11*.8)
 par(oma=c(2,2,1,2)) # bottom, left, top, right
 m <- matrix(c(1,1,2,3,4,5,6,7),nrow=4,ncol=2,byrow=TRUE)
 layout(mat = m,heights = c(0.1255,0.3,0.3,0.3))
@@ -524,3 +650,4 @@ while (counter <= 5){
 mtext("time(days)",side=1,line=0,outer=TRUE,cex=1.3)
 mtext("number of people",side=2,line=0,outer=TRUE,cex=1.3,las=0)
 dev.off()
+
